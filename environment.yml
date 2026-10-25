@@ -1,0 +1,16 @@
+name: gpu-dev
+channels:
+  - nvidia/label/cuda-12.6.3
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools>=77
+  - wheel
+  - cmake
+  - ninja
+  - make
+  - cuda-toolkit=12.6.3
+  - gcc_linux-64=12.4.0
+  - gxx_linux-64=12.4.0

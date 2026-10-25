@@ -1,0 +1,11 @@
+# Local build output, benchmark checkout, and run logs
+/build/
+/external/
+/logs/
+/nccl-tests/
+__pycache__/
+*.py[cod]
+*.o
+*.so
+.venv/
+.ipynb_checkpoints/
