@@ -18,6 +18,13 @@ cd ~/dev/GPU-Learning
 
 ## 示例
 
+`doc/nccl_example/` 五篇文章的配套实验在 [examples/nccl_example](examples/nccl_example/README.md)。
+每篇对应独立目录，包含源码、运行说明和 Makefile；例如：
+
+```bash
+make -C examples/nccl_example/02_process_groups DEVICE=cpu
+```
+
 | 文件 | 内容 |
 | --- | --- |
 | `verify_env.py` | 版本、GPU 与双卡矩阵乘法正确性检查 |
