@@ -292,6 +292,113 @@ int main() {
         CUDA_CHECK(cudaFree(d_result));
     }
 
+    // ========================================================================
+    printf("\n========== Part 5: 串行传输 vs 分块重叠传输 ==========\n");
+    // ========================================================================
+    // 思路（教程 7.3 节的解法）：把 192MB 大数组切成 CHUNK 个块，
+    // 每块用独立的 Stream（队列）：
+    //     stream0: [上传块0][算块0][回传块0]
+    //     stream1:            [上传块1][算块1][回传块1]
+    // GPU 算块 0 的同时，DMA 引擎在给 stream1 上传块 1 —— 传输与计算重叠
+    // 串行版 = cudaMemcpy（同步，全传完才能算）；重叠版 = cudaMemcpyAsync + 多流
+    {
+        const int CHUNKS   = 8;                    // 切 8 块，每块 8MB
+        const int chunkN   = N / CHUNKS;           // 每块元素数
+        const size_t chunkSz = chunkN * sizeof(float);
+        printf("数据切 %d 块，每块 %.0f MB，对比串行 cudaMemcpy vs 多 Stream 重叠\n",
+               CHUNKS, chunkSz / 1048576.0);
+
+        // ---- pinned 主机内存：异步拷贝的硬性要求 ----
+        // cudaMemcpyAsync 的 H2D/D2H 源和目标中，主机侧必须是锁页内存，
+        // 否则驱动退化为同步行为（内部还要中转，重叠完全失效）
+        float *p_A, *p_B, *p_C;
+        CUDA_CHECK(cudaMallocHost(&p_A, size));
+        CUDA_CHECK(cudaMallocHost(&p_B, size));
+        CUDA_CHECK(cudaMallocHost(&p_C, size));
+        memcpy(p_A, h_A, size);                    // 普通内存 → pinned 中转一次
+        memcpy(p_B, h_B, size);
+
+        // 创建 CHUNks 个流：每个流是一条独立的 GPU 任务队列，
+        // 不同流之间没有隐式依赖，引擎可以并行调度
+        cudaStream_t streams[CHUNKS];
+        for (int i = 0; i < CHUNKS; ++i)
+            CUDA_CHECK(cudaStreamCreate(&streams[i]));
+
+        cudaEvent_t tBeg, tEnd;
+        CUDA_CHECK(cudaEventCreate(&tBeg));
+        CUDA_CHECK(cudaEventCreate(&tEnd));
+
+        // ========== 版本 1：串行（基准）==========
+        // 逐块 memcpy + kernel，全程同步：传输时 GPU 闲着，计算时 DMA 闲着
+        CUDA_CHECK(cudaEventRecord(tBeg));
+        for (int i = 0; i < CHUNKS; ++i) {
+            float *a = d_A + (size_t)i * chunkN;
+            float *b = d_B + (size_t)i * chunkN;
+            float *c = d_C + (size_t)i * chunkN;
+            CUDA_CHECK(cudaMemcpy(a, p_A + (size_t)i * chunkN, chunkSz, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(b, p_B + (size_t)i * chunkN, chunkSz, cudaMemcpyHostToDevice));
+            vectorAdd<<<(chunkN + 255) / 256, 256>>>(a, b, c, chunkN);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(p_C + (size_t)i * chunkN, c, chunkSz, cudaMemcpyDeviceToHost));
+        }
+        CUDA_CHECK(cudaEventRecord(tEnd));
+        CUDA_CHECK(cudaEventSynchronize(tEnd));
+        float serial_ms;
+        CUDA_CHECK(cudaEventElapsedTime(&serial_ms, tBeg, tEnd));
+
+        // 验证串行版正确性
+        int errors = 0;
+        for (int i = 0; i < N; ++i)
+            if (fabsf(p_C[i] - h_C_cpu[i]) > 1e-5f) errors++;
+        printf("串行版验证   : %s\n", errors == 0 ? "通过" : "失败");
+
+        // ========== 版本 2：多 Stream 重叠 ==========
+        // 关键差异：
+        //   a) cudaMemcpyAsync   —— 立即返回，DMA 引擎异步搬
+        //   b) kernel 放进同一流的第 i 块 —— 与流内拷贝按序执行，
+        //      但与"其他流"的拷贝/计算可以并行
+        // 一个流内的三步（上传→算→回传）仍有依赖，重叠发生在相邻流之间
+        CUDA_CHECK(cudaEventRecord(tBeg));
+        for (int i = 0; i < CHUNKS; ++i) {
+            float *a = d_A + (size_t)i * chunkN;
+            float *b = d_B + (size_t)i * chunkN;
+            float *c = d_C + (size_t)i * chunkN;
+            CUDA_CHECK(cudaMemcpyAsync(a, p_A + (size_t)i * chunkN, chunkSz,
+                                       cudaMemcpyHostToDevice, streams[i]));
+            CUDA_CHECK(cudaMemcpyAsync(b, p_B + (size_t)i * chunkN, chunkSz,
+                                       cudaMemcpyHostToDevice, streams[i]));
+            vectorAdd<<<(chunkN + 255) / 256, 256, 0, streams[i]>>>(a, b, c, chunkN);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpyAsync(p_C + (size_t)i * chunkN, c, chunkSz,
+                                       cudaMemcpyDeviceToHost, streams[i]));
+        }
+        // 等所有流全部做完（每个流都打一个事件再同步，或简单粗暴全设备同步）
+        CUDA_CHECK(cudaEventRecord(tEnd));
+        CUDA_CHECK(cudaEventSynchronize(tEnd));
+        float overlap_ms;
+        CUDA_CHECK(cudaEventElapsedTime(&overlap_ms, tBeg, tEnd));
+
+        // 验证重叠版正确性（重叠不能以牺牲正确性为代价）
+        errors = 0;
+        for (int i = 0; i < N; ++i)
+            if (fabsf(p_C[i] - h_C_cpu[i]) > 1e-5f) errors++;
+        printf("重叠版验证   : %s\n", errors == 0 ? "通过" : "失败");
+
+        // ---- 对比报表 ----
+        printf("串行（memcpy 同步）  : %8.2f ms\n", serial_ms);
+        printf("重叠（8 流 Async）   : %8.2f ms   (快 %.2fx)\n",
+               overlap_ms, serial_ms / overlap_ms);
+        printf("-> 上传块i+1 与 计算块i 并行，PCIe 与 SM 同时忙碌\n");
+
+        for (int i = 0; i < CHUNKS; ++i)
+            CUDA_CHECK(cudaStreamDestroy(streams[i]));
+        CUDA_CHECK(cudaEventDestroy(tBeg));
+        CUDA_CHECK(cudaEventDestroy(tEnd));
+        CUDA_CHECK(cudaFreeHost(p_A));
+        CUDA_CHECK(cudaFreeHost(p_B));
+        CUDA_CHECK(cudaFreeHost(p_C));
+    }
+
     // ========== 清理（五步流程第 5 步）==========
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
